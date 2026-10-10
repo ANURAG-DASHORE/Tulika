@@ -1,0 +1,11 @@
+body{font-family:system-ui,sans-serif;background:#f6f4fa;margin:0;color:#1b2430}
+main{max-width:480px;margin:40px auto;padding:24px;background:#fff;border-radius:14px;box-shadow:0 4px 20px #0001}
+h1{margin:0;color:#50367f}.brand{display:flex;align-items:center;gap:12px}.sub{color:#667;font-size:.9rem;margin-top:4px}
+input{width:100%;box-sizing:border-box;padding:10px;margin:6px 0;border:1px solid #ccd;border-radius:8px;font-size:1rem}
+button{padding:10px 16px;border:0;border-radius:8px;background:#50367f;color:#fff;font-size:1rem;cursor:pointer}
+button.ghost{background:#ece6f4;color:#50367f}
+.row{display:flex;gap:8px;align-items:center}.row input{margin:0}.between{justify-content:space-between;margin:12px 0}
+ul{list-style:none;padding:0}li{display:flex;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid #eef}
+li.done span{text-decoration:line-through;color:#889}li span{flex:1}
+li button{padding:4px 10px;background:#fde8e8;color:#c0392b}
+#msg{min-height:1.2em;color:#c0392b;font-size:.9rem}

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tulika</title>
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main>
+  <div class="brand"><img src="/static/logo.svg" alt="Tulika tulip logo" width="45" height="56"><h1>Tulika</h1></div>
+  <p class="sub">Served by a web server written with only the Python standard library.</p>
+
+  <section id="auth">
+    <input id="username" placeholder="username" autocomplete="username">
+    <input id="password" type="password" placeholder="password (8+ chars)" autocomplete="current-password">
+    <div class="row">
+      <button id="login">Log in</button>
+      <button id="register" class="ghost">Register</button>
+    </div>
+  </section>
+
+  <section id="app" hidden>
+    <div class="row between"><strong id="who"></strong><button id="logout" class="ghost">Log out</button></div>
+    <form id="add" class="row">
+      <input id="title" placeholder="New task" maxlength="200" required>
+      <button>Add</button>
+    </form>
+    <ul id="tasks"></ul>
+  </section>
+
+  <p id="msg" role="status"></p>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
