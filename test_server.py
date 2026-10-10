@@ -2,9 +2,13 @@
 import http.client
 import json
 import os
+import shutil
 import socket
+import ssl
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 import server
@@ -125,14 +129,119 @@ class ServiceTests(unittest.TestCase):
     def test_malformed_request_400(self):
         self.assertTrue(raw(self.port, b"garbage\r\n\r\n").startswith(b"HTTP/1.1 400"))
 
-    def test_chunked_501(self):
-        out = raw(self.port, b"POST /api/tasks HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+    # --- chunked request bodies ----------------------------------------
+    def chunked(self, chunks, extra=b""):
+        body = b"".join(b"%x\r\n%s\r\n" % (len(c), c) for c in chunks) + b"0\r\n\r\n"
+        auth = self.tok["Authorization"].encode()
+        head = (b"POST /api/tasks HTTP/1.1\r\nAuthorization: " + auth +
+                b"\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n"
+                b"Connection: close\r\n" + extra + b"\r\n")
+        return raw(self.port, head + body)
+
+    def test_chunked_body_is_reassembled(self):
+        out = self.chunked([b'{"title":', b'"chunk', b'ed task"}'])
+        self.assertTrue(out.startswith(b"HTTP/1.1 201"))
+        self.assertIn(b"chunked task", out)
+
+    def test_chunked_with_extension_and_trailer(self):
+        body = b'5;ext=1\r\n{"tit\r\n' + b'0f\r\nle":"trailers"}\r\n' + b"0\r\nX-Trailer: ignored\r\n\r\n"
+        auth = self.tok["Authorization"].encode()
+        out = raw(self.port, b"POST /api/tasks HTTP/1.1\r\nAuthorization: " + auth +
+                  b"\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n"
+                  b"Connection: close\r\n\r\n" + body)
+        self.assertTrue(out.startswith(b"HTTP/1.1 201"), out[:80])
+        self.assertIn(b"trailers", out)
+
+    def test_chunked_oversize_413(self):
+        out = self.chunked([b"x" * 40000, b"y" * 40000])
+        self.assertTrue(out.startswith(b"HTTP/1.1 413"))
+
+    def test_chunked_bad_size_400(self):
+        out = raw(self.port, b"POST /api/tasks HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+                             b"Connection: close\r\n\r\nzz\r\nabc\r\n0\r\n\r\n")
+        self.assertTrue(out.startswith(b"HTTP/1.1 400"))
+
+    def test_chunked_plus_content_length_400(self):
+        out = raw(self.port, b"POST /api/tasks HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+                             b"Content-Length: 4\r\nConnection: close\r\n\r\n0\r\n\r\n")
+        self.assertTrue(out.startswith(b"HTTP/1.1 400"))
+
+    def test_unsupported_transfer_encoding_501(self):
+        out = raw(self.port, b"POST /api/tasks HTTP/1.1\r\nTransfer-Encoding: gzip\r\n"
+                             b"Connection: close\r\n\r\n")
         self.assertTrue(out.startswith(b"HTTP/1.1 501"))
+
+    # --- keep-alive ------------------------------------------------------
+    def test_keep_alive_reuses_connection(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            for _ in range(3):
+                c.request("GET", "/api/health")
+                r = c.getresponse()
+                r.read()
+                self.assertEqual(r.status, 200)
+                self.assertEqual(r.getheader("Connection"), "keep-alive")
+                self.assertIsNotNone(c.sock)  # still the same open connection
+        finally:
+            c.close()
+
+    def test_pipelined_requests(self):
+        one = b"GET /api/health HTTP/1.1\r\n\r\n"
+        out = raw(self.port, one * 2 + b"GET /api/health HTTP/1.1\r\nConnection: close\r\n\r\n")
+        self.assertEqual(out.count(b"HTTP/1.1 200"), 3)
+
+    def test_connection_close_is_honoured(self):
+        out = raw(self.port, b"GET /api/health HTTP/1.1\r\nConnection: close\r\n\r\n")
+        self.assertIn(b"Connection: close", out)
+
+    def test_http10_closes_by_default(self):
+        out = raw(self.port, b"GET /api/health HTTP/1.0\r\n\r\n")
+        self.assertIn(b"Connection: close", out)
+
+    def test_ordinary_errors_keep_the_connection(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            c.request("GET", "/nope")
+            r = c.getresponse()
+            r.read()
+            self.assertEqual(r.status, 404)
+            self.assertIsNotNone(c.sock)
+            c.request("GET", "/api/health")
+            r = c.getresponse()
+            r.read()
+            self.assertEqual(r.status, 200)
+        finally:
+            c.close()
+
+    def test_framing_errors_close_the_connection(self):
+        out = raw(self.port, b"POST /api/tasks HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n")
+        self.assertIn(b"Connection: close", out)
+
+    def test_idle_connection_is_closed(self):
+        old, server.KEEPALIVE_TIMEOUT = server.KEEPALIVE_TIMEOUT, 0.3
+        try:
+            s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            s.sendall(b"GET /api/health HTTP/1.1\r\n\r\n")
+            self.assertIn(b"200", s.recv(4096))
+            time.sleep(0.8)
+            self.assertEqual(s.recv(4096), b"")  # server hung up on us
+            s.close()
+        finally:
+            server.KEEPALIVE_TIMEOUT = old
+
+    def test_max_requests_per_connection(self):
+        old, server.MAX_REQUESTS_PER_CONN = server.MAX_REQUESTS_PER_CONN, 2
+        try:
+            out = raw(self.port, b"GET /api/health HTTP/1.1\r\n\r\n" * 2)
+        finally:
+            server.MAX_REQUESTS_PER_CONN = old
+        self.assertEqual(out.count(b"HTTP/1.1 200"), 2)
+        self.assertEqual(out.count(b"Connection: close"), 1)  # only the last one
 
     def test_path_traversal_blocked(self):
         for p in (b"/static/../server.py", b"/static/%2e%2e/server.py", b"/static/..%2fserver.py",
                   b"/static//etc/passwd", b"/static/%2e%2e%2f%2e%2e%2fetc%2fpasswd", b"/static/..%5cserver.py"):
-            out = raw(self.port, b"GET " + p + b" HTTP/1.1\r\n\r\n")
+            out = raw(self.port, b"GET " + p + b" HTTP/1.1\r\nConnection: close\r\n\r\n")
             self.assertTrue(out.startswith(b"HTTP/1.1 404"), p)
             self.assertNotIn(b"import hashlib", out, p)
 
@@ -275,6 +384,55 @@ class ServiceTests(unittest.TestCase):
         ids = [t["id"] for t in request(self.port, "GET", "/api/tasks?q=race", headers=self.tok)[1]["tasks"]]
         self.assertEqual(len(ids), len(set(ids)))
         self.assertGreaterEqual(len(ids), 30)
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl not installed")
+class TlsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cert, key = os.path.join(cls.tmp.name, "c.pem"), os.path.join(cls.tmp.name, "k.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                        "-days", "1", "-subj", "/CN=localhost"], check=True, capture_output=True)
+        server.init_store(os.path.join(cls.tmp.name, "db.json"))
+        server.LIMITERS["global"] = server.RateLimiter(100000, 60)
+        server.LIMITERS["auth"] = server.RateLimiter(100000, 60)
+        cls.srv = server.make_server("127.0.0.1", 0, cert, key)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.ctx = ssl._create_unverified_context()  # self-signed test certificate
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.tmp.cleanup()
+
+    def call(self, method, path, body=None):
+        c = http.client.HTTPSConnection("127.0.0.1", self.port, timeout=5, context=self.ctx)
+        c.request(method, path, body=json.dumps(body) if body else None,
+                  headers={"Content-Type": "application/json"} if body else {})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        return r.status, json.loads(data), r
+
+    def test_https_works_and_cookie_is_secure(self):
+        self.assertEqual(self.call("GET", "/api/health")[0], 200)
+        self.call("POST", "/api/register", {"username": "tlsuser", "password": "tls-pass-123"})
+        s, _, r = self.call("POST", "/api/login", {"username": "tlsuser", "password": "tls-pass-123"})
+        self.assertEqual(s, 200)
+        self.assertIn("Secure", r.getheader("Set-Cookie"))
+
+    def test_plain_http_is_refused_on_tls_port(self):
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        s.sendall(b"GET /api/health HTTP/1.1\r\nConnection: close\r\n\r\n")
+        try:
+            data = s.recv(4096)
+        except OSError:
+            data = b""
+        s.close()
+        self.assertNotIn(b"200 OK", data)
 
 
 if __name__ == "__main__":

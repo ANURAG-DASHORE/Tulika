@@ -70,14 +70,16 @@ def main():
     show("unknown route", call("GET", "/api/nothing"), 404)
     show("wrong method (DELETE /api/health)", call("DELETE", "/api/health"), 405)
     show("empty title", call("POST", "/api/tasks", {"title": "  "}, token), 400)
+    show("short password", call("POST", "/api/register", {"username": "newbie", "password": "abc"}), 400)
+    show("duplicate username", call("POST", "/api/register", {"username": USER.upper(), "password": PASSWORD}), 409)
     show("path traversal", call("GET", "/static/../server.py"), 404)
     show("encoded traversal", call("GET", "/static/%2e%2e%2fserver.py"), 404)
     show("oversized body", call("POST", "/api/tasks", {"title": "x" * 70000}, token), 413)
 
     if "--ratelimit" in sys.argv:
-        print("\n== Rate limiter: 8 rapid wrong logins ==")
-        codes = [call("POST", "/api/login", {"username": USER, "password": "bad-bad-bad"})[0] for _ in range(8)]
-        print("status codes:", codes, "(a couple of 401s, then 429)")
+        print("\n== Rate limiter: 14 rapid wrong logins (limit is 10 per minute) ==")
+        codes = [call("POST", "/api/login", {"username": USER, "password": "bad-bad-bad"})[0] for _ in range(14)]
+        print("status codes:", codes, "(expect 401s first, then 429 once past 10)")
         print("Login is blocked for about a minute for this IP; the UI will say 'too many attempts'.")
 
     print("\nOpen http://localhost:%d and log in as %s / %s" % (PORT, USER, PASSWORD))

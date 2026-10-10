@@ -7,6 +7,7 @@ Everything below is written by hand on top of raw sockets:
   3. Sessions: scrypt password hashing + random bearer/cookie tokens
   4. Persistence: JSON file with atomic, fsync'd writes
   5. Token-bucket rate limiting, path-traversal and body-size protection
+  6. HTTP/1.1 keep-alive, chunked request bodies, optional TLS (TLS_CERT / TLS_KEY)
 """
 import hashlib
 import hmac
@@ -18,6 +19,7 @@ import re
 import secrets
 import socket
 import socketserver
+import ssl
 import sys
 import tempfile
 import threading
@@ -37,6 +39,10 @@ MAX_BODY = 64 * 1024
 MAX_STATIC = 2 * 1024 * 1024
 SOCKET_TIMEOUT = 10
 MAX_CONNECTIONS = 100
+KEEPALIVE_TIMEOUT = 5          # seconds a connection may sit idle between requests
+MAX_REQUESTS_PER_CONN = 100
+TLS_CERT = os.environ.get("TLS_CERT")
+TLS_KEY = os.environ.get("TLS_KEY")
 SESSION_TTL = 24 * 3600
 MAX_TASKS_PER_USER = 500
 SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}
@@ -101,9 +107,10 @@ def parse_query(qs):
 
 
 class Request:
-    def __init__(self, method, path, query, headers, body, ip):
+    def __init__(self, method, path, query, headers, body, ip, version="HTTP/1.1"):
         self.method, self.path, self.query = method, path, query
-        self.headers, self.body, self.ip = headers, body, ip
+        self.headers, self.body, self.ip, self.version = headers, body, ip, version
+        self.secure = False
         self.params, self.user, self.token_hash = {}, None, None
 
     def data(self):
@@ -122,6 +129,35 @@ class Request:
         if ctype == "application/x-www-form-urlencoded":
             return parse_query(self.body.decode("utf-8", errors="replace"))
         raise HttpError(415, "use application/json or application/x-www-form-urlencoded")
+
+
+def read_chunked(rfile):
+    """Decode a chunked body by hand, enforcing MAX_BODY as chunks arrive."""
+    parts, total = [], 0
+    while True:
+        line = rfile.readline(MAX_REQUEST_LINE + 1)
+        if not line.endswith(b"\n") or len(line) > MAX_REQUEST_LINE:
+            raise HttpError(400, "bad chunk header")
+        size_txt = line.split(b";", 1)[0].strip()  # ignore chunk extensions
+        if not re.fullmatch(rb"[0-9A-Fa-f]{1,8}", size_txt):
+            raise HttpError(400, "bad chunk size")
+        size = int(size_txt, 16)
+        if size == 0:
+            break
+        total += size
+        if total > MAX_BODY:
+            raise HttpError(413, "body too large (max %d bytes)" % MAX_BODY)
+        chunk = rfile.read(size)
+        if len(chunk) != size or rfile.readline(3) not in (b"\r\n", b"\n"):
+            raise HttpError(400, "malformed chunk")
+        parts.append(chunk)
+    for _ in range(MAX_HEADERS):  # trailers: read and ignore, up to the blank line
+        t = rfile.readline(MAX_REQUEST_LINE + 1)
+        if t in (b"\r\n", b"\n"):
+            return b"".join(parts)
+        if not t:
+            break
+    raise HttpError(400, "bad chunked trailer")
 
 
 def read_request(conn, rfile, ip):
@@ -158,11 +194,16 @@ def read_request(conn, rfile, ip):
         value = value.strip()
         headers[name] = headers[name] + ", " + value if name in headers else value
 
-    if "transfer-encoding" in headers:
-        raise HttpError(501, "Transfer-Encoding is not supported; send Content-Length")
-    body = b""
-    cl = headers.get("content-length")
-    if cl is not None:
+    te, cl, body = headers.get("transfer-encoding"), headers.get("content-length"), b""
+    if te is not None:
+        if cl is not None:  # classic request-smuggling shape: refuse it
+            raise HttpError(400, "both Transfer-Encoding and Content-Length sent")
+        if te.lower() != "chunked":
+            raise HttpError(501, "only 'chunked' Transfer-Encoding is supported")
+        if headers.get("expect", "").lower() == "100-continue":
+            conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+        body = read_chunked(rfile)
+    elif cl is not None:
         if not re.fullmatch(r"[0-9]{1,10}", cl):
             raise HttpError(400, "bad Content-Length")
         n = int(cl)
@@ -180,7 +221,7 @@ def read_request(conn, rfile, ip):
     path = pct_decode(path_raw)
     if "\x00" in path:
         raise HttpError(400, "bad path")
-    return Request(method, path, parse_query(qs), headers, body, ip)
+    return Request(method, path, parse_query(qs), headers, body, ip, version)
 
 
 # --------------------------------------------------------------------------
@@ -257,7 +298,7 @@ class RateLimiter:
 
 LIMITERS = {
     "global": RateLimiter(120, 60),  # 120 requests/minute per IP
-    "auth": RateLimiter(5, 60),      # 5 login/register attempts/minute per IP
+    "auth": RateLimiter(10, 60),     # 10 login/register attempts/minute per IP
 }
 
 
@@ -398,7 +439,7 @@ def login(req):
         sessions[sha(token)] = {"user": rec["username"], "exp": now + SESSION_TTL}
         STORE.save()
     cookie = "session=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=%d" % (token, SESSION_TTL)
-    if TRUST_PROXY and req.headers.get("x-forwarded-proto") == "https":
+    if req.secure or (TRUST_PROXY and req.headers.get("x-forwarded-proto") == "https"):
         cookie += "; Secure"
     return json_response({"username": rec["username"], "token": token, "expires_in": SESSION_TTL},
                          headers={"Set-Cookie": cookie})
@@ -531,8 +572,11 @@ SECURITY_HEADERS = {
 }
 
 
-def send(conn, resp):
-    headers = {"Content-Length": str(len(resp.body)), "Connection": "close", **SECURITY_HEADERS, **resp.headers}
+def send(conn, resp, keep_alive=False):
+    headers = {"Content-Length": str(len(resp.body)),
+               "Connection": "keep-alive" if keep_alive else "close", **SECURITY_HEADERS, **resp.headers}
+    if keep_alive:
+        headers["Keep-Alive"] = "timeout=%d" % KEEPALIVE_TIMEOUT
     lines = ["HTTP/1.1 %d %s" % (resp.status, REASONS.get(resp.status, "Unknown"))]
     for k, v in headers.items():
         if "\r" in v or "\n" in v:
@@ -556,6 +600,30 @@ def client_ip(req, peer):
 CONN_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
 
+def wants_keep_alive(req):
+    tokens = [t.strip() for t in req.headers.get("connection", "").lower().split(",")]
+    if req.version == "HTTP/1.0":
+        return "keep-alive" in tokens
+    return "close" not in tokens
+
+
+def linger(conn):
+    """Before closing after an early error reply, drain what the client is still
+    sending. Closing with unread data makes the OS send a reset, which can wipe
+    out our response before the client reads it."""
+    try:
+        conn.shutdown(socket.SHUT_WR)
+        conn.settimeout(0.5)
+        left = 256 * 1024
+        while left > 0:
+            data = conn.recv(8192)
+            if not data:
+                break
+            left -= len(data)
+    except OSError:
+        pass
+
+
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         conn, peer = self.request, self.client_address[0]
@@ -565,40 +633,69 @@ class Handler(socketserver.BaseRequestHandler):
             except OSError:
                 pass
             return
-        start, method, path, status, rfile = time.monotonic(), "-", "-", 500, None
+        rfile = None
         try:
             conn.settimeout(SOCKET_TIMEOUT)
+            if isinstance(conn, ssl.SSLSocket):
+                conn.do_handshake()  # done here, in the worker thread, so a slow client can't stall accept()
             rfile = conn.makefile("rb")
-            try:
-                req = read_request(conn, rfile, peer)
-                if req is None:
-                    return
-                method, path = req.method, req.path
-                req.ip = client_ip(req, peer)
-                ok, wait = LIMITERS["global"].check(req.ip)
-                if not ok:
-                    raise HttpError(429, "rate limit exceeded", {"Retry-After": str(wait)})
-                resp = dispatch(req)
-            except HttpError as e:
-                resp = error_response(e)
-            except socket.timeout:
-                resp = error_response(HttpError(408, "request timed out"))
-            except OSError:
-                return
-            except Exception:
-                log(traceback.format_exc())
-                resp = error_response(HttpError(500, "internal server error"))
-            status = resp.status
-            try:
-                send(conn, resp)
-            except OSError:
-                pass
+            total = MAX_REQUESTS_PER_CONN
+            for n in range(total):
+                if not self.serve_one(conn, rfile, peer, first=(n == 0), last=(n == total - 1)):
+                    break
+        except OSError:
+            pass
         finally:
             CONN_SLOTS.release()
             if rfile:
                 rfile.close()
-            if method != "-":
-                log("%s %s %s -> %d (%.0f ms)" % (peer, method, path, status, (time.monotonic() - start) * 1000))
+
+    def serve_one(self, conn, rfile, peer, first, last):
+        """Handle one request. Returns True if the connection should stay open."""
+        if not first:  # idle between requests: wait quietly, never send a 408
+            conn.settimeout(KEEPALIVE_TIMEOUT)
+            try:
+                if not rfile.peek(1):
+                    return False
+            except OSError:
+                return False
+        conn.settimeout(SOCKET_TIMEOUT)
+        start, method, path, keep, drain = time.monotonic(), "-", "-", False, False
+        try:
+            try:
+                req = read_request(conn, rfile, peer)
+            except HttpError as e:  # framing may be broken, so answer and then close
+                resp, drain = error_response(e), True
+            else:
+                if req is None:
+                    return False
+                method, path = req.method, req.path
+                req.secure = isinstance(conn, ssl.SSLSocket)
+                req.ip = client_ip(req, peer)
+                keep = wants_keep_alive(req) and not last
+                try:
+                    ok, wait = LIMITERS["global"].check(req.ip)
+                    if not ok:
+                        raise HttpError(429, "rate limit exceeded", {"Retry-After": str(wait)})
+                    resp = dispatch(req)
+                except HttpError as e:  # request was read fully, so the connection is still in sync
+                    resp = error_response(e)
+                except Exception:
+                    log(traceback.format_exc())
+                    resp = error_response(HttpError(500, "internal server error"))
+        except socket.timeout:
+            resp, drain = error_response(HttpError(408, "request timed out")), True
+        except OSError:
+            return False
+        try:
+            send(conn, resp, keep)
+        except OSError:
+            return False
+        if method != "-":
+            log("%s %s %s -> %d (%.0f ms)" % (peer, method, path, resp.status, (time.monotonic() - start) * 1000))
+        if drain:
+            linger(conn)
+        return keep
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -613,11 +710,23 @@ def init_store(path=None):
     return STORE
 
 
+def make_server(host, port, cert=None, key=None):
+    srv = Server((host, port), Handler)
+    cert, key = cert or TLS_CERT, key or TLS_KEY
+    if cert and key:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cert, key)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
+    return srv
+
+
 def main():
     init_store()
     host, port = os.environ.get("HOST", "0.0.0.0"), int(os.environ.get("PORT", "8000"))
-    with Server((host, port), Handler) as srv:
-        log("Tulika listening on http://%s:%d  (data: %s)" % (host, port, DATA_FILE))
+    with make_server(host, port) as srv:
+        scheme = "https" if TLS_CERT and TLS_KEY else "http"
+        log("Tulika listening on %s://%s:%d  (data: %s)" % (scheme, host, port, DATA_FILE))
         try:
             srv.serve_forever()
         except KeyboardInterrupt:
